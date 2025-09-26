@@ -1,0 +1,17 @@
+services:
+  qr_analyzer:
+    # コンテナイメージ名を設定
+    image: qr-analyzer:latest
+    # Dockerfileからイメージをビルド
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # コンテナ名を設定
+    container_name: qr_analyzer
+    # ホストのディレクトリをコンテナ内にマウント
+    volumes:
+      - .:/app
+    # コンテナ起動時に実行するコマンド
+    stdin_open: true
+    tty: true
+    command: ["python3", "main.py"]
