@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>QR Vector Editor</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="layout">
+    <!-- 左 1/3: 一覧 -->
+    <aside class="list-pane">
+      <h2>ファイル一覧</h2>
+      <div id="file-list" class="file-list"></div>
+    </aside>
+
+    <!-- 右 2/3: 編集ビュー -->
+    <main class="editor-pane">
+      <div id="placeholder" class="placeholder">
+        左の一覧からファイルを選択してください
+      </div>
+
+      <div id="editor" class="editor hidden">
+        <div class="topbar">
+          <div>
+            <span id="meta"></span>
+          </div>
+          <div>
+            Zoom:
+            <input type="range" id="zoom" min="8" max="32" value="16" />
+            <span id="zoom-val">16</span>x
+            <span id="status"></span>
+          </div>
+        </div>
+
+        <div class="compare">
+          <div class="panel">
+            <h3>Original (tobakosan)</h3>
+            <img id="orig-large" alt="original" />
+          </div>
+          <div class="panel">
+            <h3>Rendered (editable)</h3>
+            <canvas id="qr-canvas"></canvas>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    // サーバ側で preselect を渡された場合（/edit/<name>）
+    const PRESELECT = "{{ preselect | default('', true) }}";
+  </script>
+  <script src="/static/index.js"></script>
+</body>
+</html>

@@ -13,5 +13,8 @@ services:
       - .:/app
     # コンテナ起動時に実行するコマンド
     stdin_open: true
+    ports:
+      - "5000:5000"
     tty: true
     command: ["python3", "main.py"]
+

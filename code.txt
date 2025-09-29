@@ -1,3 +1,355 @@
+====./tools/qr_vector_editor_flask/app.py ====
+# tools/qr_vector_editor_flask/app.py
+from __future__ import annotations
+import os
+from io import BytesIO
+from pathlib import Path
+from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, abort
+
+# 重要：ロジックを別モジュールに集約
+from .editor_app import (
+    list_json_items,
+    load_json_file,
+    get_original_png,
+    render_png_from_json,
+    toggle_cell_and_save,
+    save_whole_json,
+    export_png_from_json,
+    OUTPUT_DIR,  # for download endpoint
+)
+
+# Flask のテンプレ/静的パスをこのファイル相対に固定
+THIS_DIR = Path(__file__).resolve().parent
+app = Flask(
+    __name__,
+    static_folder=str(THIS_DIR / "static"),
+    template_folder=str(THIS_DIR / "templates"),
+)
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", preselect="")
+
+
+@app.route("/edit/<name>")
+def edit(name: str):
+    # JSON が無ければ 404
+    try:
+        load_json_file(name)
+    except Exception:
+        abort(404)
+    return render_template("index.html", preselect=name)
+
+
+# -------- API --------
+@app.get("/api/list")
+def api_list():
+    items = list_json_items()
+    return jsonify(items)
+
+
+@app.get("/api/load")
+def api_load():
+    filename = request.args.get("file")
+    if not filename:
+        return jsonify({"error": "param 'file' required"}), 400
+    try:
+        obj = load_json_file(filename)
+        return jsonify(obj)
+    except FileNotFoundError:
+        return jsonify({"error": "not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/api/original")
+def api_original():
+    filename = request.args.get("file")
+    size = int(request.args.get("size", "256"))
+    if not filename:
+        return jsonify({"error": "param 'file' required"}), 400
+    try:
+        data = get_original_png(filename, size=size)
+        return send_file(BytesIO(data), mimetype="image/png")
+    except FileNotFoundError:
+        return jsonify({"error": "original not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/api/render")
+def api_render():
+    filename = request.args.get("file")
+    size = int(request.args.get("size", "256"))
+    if not filename:
+        return jsonify({"error": "param 'file' required"}), 400
+    try:
+        data = render_png_from_json(filename, size=size)
+        return send_file(BytesIO(data), mimetype="image/png")
+    except FileNotFoundError:
+        return jsonify({"error": "json not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/toggle")
+def api_toggle():
+    data = request.get_json(silent=True) or {}
+    filename = data.get("file")
+    gx = data.get("gx")
+    gy = data.get("gy")
+    if filename is None or gx is None or gy is None:
+        return jsonify({"error": "missing fields"}), 400
+    try:
+        new_val = toggle_cell_and_save(filename, int(gx), int(gy))
+        return jsonify({"ok": True, "value": int(new_val)})
+    except FileNotFoundError:
+        return jsonify({"error": "json not found"}), 404
+    except IndexError:
+        return jsonify({"error": "index out of range"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/save")
+def api_save():
+    data = request.get_json(silent=True) or {}
+    filename = data.get("file")
+    vector = data.get("vector")
+    module = data.get("module")
+    width = data.get("width")
+    height = data.get("height")
+    if not filename or vector is None or module is None or width is None or height is None:
+        return jsonify({"error": "missing fields"}), 400
+    try:
+        saved = save_whole_json(filename, vector, int(module), int(width), int(height))
+        return jsonify({"ok": True, "saved": saved})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.post("/api/export_png")
+def api_export_png():
+    data = request.get_json(silent=True) or {}
+    filename = data.get("file")
+    out_name = data.get("out_name")
+    if not filename:
+        return jsonify({"error": "missing fields"}), 400
+    try:
+        saved = export_png_from_json(filename, out_name=out_name)
+        return jsonify({"ok": True, "saved": saved})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/download/<path:fname>")
+def download(fname: str):
+    return send_from_directory(OUTPUT_DIR, fname, as_attachment=True)
+
+
+# tools/qr_vector_editor_flask/app.py 末尾付近
+
+# ... 既存の import や app = Flask(...) の下はそのまま ...
+
+# 末尾付近にヘルスチェックを追加
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+def start(host: str | None = None, port: int | None = None, debug: bool = False):
+    h = host or os.environ.get("FLASK_RUN_HOST", "0.0.0.0")  # ← 既定も 0.0.0.0 に
+    p = int(port or os.environ.get("FLASK_RUN_PORT", "5000"))
+    app.run(host=h, port=p, debug=debug, use_reloader=False, threaded=True)
+
+if __name__ == "__main__":
+    # 直接実行時だけデバッグONでOK（reloaderは引き続き無効）
+    start(debug=True)
+
+
+====./tools/qr_vector_editor_flask/editor_app.py ====
+# tools/qr_vector_editor_flask/editor_app.py
+from __future__ import annotations
+import json
+from io import BytesIO
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+import numpy as np
+from PIL import Image
+
+# ルート相対（このファイルからの相対パスにしておく）
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+VECTOR_DIR = BASE_DIR / "qr_vector"
+ORIG_DIR = BASE_DIR / "qr_tobakosan"
+OUTPUT_DIR = BASE_DIR / "qr_raimu"
+
+VECTOR_DIR.mkdir(exist_ok=True, parents=True)
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
+
+# ---------- 基本I/O ----------
+def _load_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_json(obj: Dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def _find_alt_original(stem: str) -> Optional[Path]:
+    for ext in (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"):
+        p = ORIG_DIR / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def _rebuild_image_from_vector(vector: List[List[int]], width: int, height: int, module: int) -> Image.Image:
+    """1=黒(0), 0=白(255) でセル塗りつぶしして Pillow Image(L) を返す"""
+    img = np.ones((height, width), dtype=np.uint8) * 255
+    cell_w = max(1, width // module)
+    cell_h = max(1, height // module)
+    grid = np.array(vector, dtype=int)
+
+    for gy in range(module):
+        y0 = gy * cell_h
+        y1 = (gy + 1) * cell_h if gy < module - 1 else height
+        for gx in range(module):
+            x0 = gx * cell_w
+            x1 = (gx + 1) * cell_w if gx < module - 1 else width
+            val = 0 if grid[gy, gx] == 1 else 255
+            img[y0:y1, x0:x1] = val
+    return Image.fromarray(img, mode="L")
+
+
+def _image_to_png_bytes(im: Image.Image) -> bytes:
+    buf = BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ---------- 公開API(ロジック) ----------
+def list_json_items() -> List[Dict[str, Any]]:
+    def _key(p: Path):
+        stem = p.stem
+        try:
+            return (0, int(stem))
+        except ValueError:
+            return (1, stem)
+
+    files = sorted(VECTOR_DIR.glob("*.json"), key=_key)
+    items: List[Dict[str, Any]] = []
+    for p in files:
+        name = p.name
+        try:
+            obj = _load_json(p)
+            module = int(obj.get("module", 0))
+            w = int(obj.get("width", 0))
+            h = int(obj.get("height", 0))
+            file_field = obj.get("file", "")
+            stem = Path(file_field).stem if file_field else p.stem
+            orig = _find_alt_original(stem)
+            items.append({
+                "json": name,
+                "module": module,
+                "width": w,
+                "height": h,
+                "original_exists": bool(orig),
+                "original_name": orig.name if orig else None,
+                "stem": stem,
+            })
+        except Exception:
+            items.append({
+                "json": name, "module": None, "width": None, "height": None,
+                "original_exists": False, "original_name": None, "stem": p.stem
+            })
+    return items
+
+
+def load_json_file(filename: str) -> Dict[str, Any]:
+    path = VECTOR_DIR / filename
+    obj = _load_json(path)
+    if not all(k in obj for k in ("vector", "module", "width", "height")):
+        raise ValueError("invalid json structure")
+    return obj
+
+
+def get_original_png(filename: str, size: int = 256) -> bytes:
+    # filename は JSON 名
+    obj = load_json_file(filename)
+    stem = Path(obj.get("file", "")).stem or Path(filename).stem
+    opath = _find_alt_original(stem)
+    if not opath:
+        raise FileNotFoundError("original not found")
+    im = Image.open(opath).convert("L")
+    im = im.resize((size, size), resample=Image.NEAREST)
+    return _image_to_png_bytes(im)
+
+
+def render_png_from_json(filename: str, size: int = 256) -> bytes:
+    obj = load_json_file(filename)
+    vector = obj["vector"]
+    module = int(obj["module"])
+    w = int(obj["width"])
+    h = int(obj["height"])
+    im = _rebuild_image_from_vector(vector, width=w, height=h, module=module)
+    im = im.resize((size, size), resample=Image.NEAREST)
+    return _image_to_png_bytes(im)
+
+
+def toggle_cell_and_save(filename: str, gx: int, gy: int) -> int:
+    path = VECTOR_DIR / filename
+    obj = _load_json(path)
+    vec = obj.get("vector")
+    module = int(obj.get("module", 0))
+    if vec is None or module <= 0:
+        raise ValueError("invalid json structure")
+    try:
+        current = int(vec[gy][gx])
+        new_val = 1 - current
+        vec[gy][gx] = new_val
+    except Exception as e:
+        raise IndexError("index out of range") from e
+    obj["vector"] = vec
+    _save_json(obj, path)
+    return int(new_val)
+
+
+def save_whole_json(filename: str, vector: List[List[int]], module: int, width: int, height: int) -> str:
+    path = VECTOR_DIR / filename
+    obj = {
+        "file": Path(filename).with_suffix(".png").name,
+        "module": int(module),
+        "width": int(width),
+        "height": int(height),
+        "vector": vector,
+    }
+    _save_json(obj, path)
+    return str(path)
+
+
+def export_png_from_json(filename: str, out_name: Optional[str] = None) -> str:
+    obj = load_json_file(filename)
+    vector = obj["vector"]
+    module = int(obj["module"])
+    w = int(obj["width"])
+    h = int(obj["height"])
+    im = _rebuild_image_from_vector(vector, width=w, height=h, module=module)
+    if not out_name:
+        out_name = Path(filename).with_suffix(".png").name
+    out_path = OUTPUT_DIR / out_name
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    im.save(out_path)
+    return str(out_path)
+
+====./tools/qr_vector_editor_flask/__init__.py ====
+
+====./tools/__init__.py ====
+
 ====./pipeline/qr_decode.py ====
 import cv2
 from pyzbar.pyzbar import decode
@@ -53,73 +405,262 @@ class QRCodeDecoder:
 import os
 import json
 import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import List, Dict, Any
+
 from pipeline.qr_enhancer import QREnhancer
 from pipeline.qr_decode import QRCodeDecoder
 
 
 class QRPipeline:
-    def __init__(self, tobako_dir: str, raimu_dir: str, enhancer_params: dict = None):
+    """
+    3ステップ実行に分割可能なパイプライン。
+
+    Step1: ベクトル作成（qr_vector/*.json）
+    Step2: JSON→画像再生成 ＋ デコード評価（evaluate.json）
+    Step3: PDF等の外部評価は main.py 側で既存モジュールを呼ぶ
+    """
+
+    def __init__(self, tobako_dir: str, raimu_dir: str,
+                 enhancer_params: dict = None,
+                 vector_dir: str = "qr_vector",
+                 statistics_dir: str = "qr_statistics"):
         self.tobako_dir = tobako_dir
         self.raimu_dir = raimu_dir
-        # enhancer_params を受け取れるように
+        self.vector_dir = vector_dir
+        self.statistics_dir = statistics_dir
         self.enhancer = QREnhancer(**(enhancer_params or {}))
         self.decoder = QRCodeDecoder()
+        self.module = self.enhancer.module
+        self._top_row_avgs_all: list[float] = []
 
-    def run(self):
-        evaluation_results = []
+    # ========= Step1 =========
+    def step1_make_vectors(self) -> None:
+        """
+        すべての入力画像を2値化→module×moduleの0/1ベクトルにし、qr_vector に JSON 保存。
+        併せてトップ行セル平均を集約し、qr_statistics/sikiiti.png を1枚だけ保存。
+        """
         if not os.path.exists(self.tobako_dir):
-            print(
-                f"エラー: 元の画像ディレクトリ '{self.tobako_dir}' が見つかりません。"
-            )
+            print(f"エラー: 入力ディレクトリ '{self.tobako_dir}' が見つかりません。")
             return
-        if not os.path.exists(self.raimu_dir):
-            os.makedirs(self.raimu_dir)
-            print(f"新しいディレクトリ '{self.raimu_dir}' を作成しました。")
+        os.makedirs(self.vector_dir, exist_ok=True)
+        os.makedirs(self.raimu_dir, exist_ok=True)
+        os.makedirs(self.statistics_dir, exist_ok=True)
 
-        # ファイル名をソートして処理順を保証
-        sorted_files = sorted(
-            os.listdir(self.tobako_dir), key=lambda x: int(os.path.splitext(x)[0])
-        )
+        def _key(x: str) -> int:
+            stem = os.path.splitext(x)[0]
+            try:
+                return int(stem)
+            except ValueError:
+                return 10**9
+
+        sorted_files = sorted(os.listdir(self.tobako_dir), key=_key)
 
         for filename in sorted_files:
-            if filename.endswith((".png", ".jpg", ".jpeg")):
-                print(f"\n--- ファイル '{filename}' の処理を開始 ---")
-                original_path = os.path.join(self.tobako_dir, filename)
-                enhanced_path = os.path.join(self.raimu_dir, filename)
+            if not filename.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
 
-                # enhancer を適用
-                enhanced_image = self.enhancer.binarize(original_path)
-                if enhanced_image is not None:
-                    cv2.imwrite(enhanced_path, enhanced_image)
-                    print(f"鮮明化された画像を '{enhanced_path}' に保存しました。")
-                else:
-                    print(f"警告: '{original_path}' の処理に失敗しました。")
-                    continue
+            print(f"\n[Step1] ベクトル化: '{filename}'")
+            in_path = os.path.join(self.tobako_dir, filename)
+            binary = self.enhancer.binarize(in_path)
+            if binary is None:
+                print(f"  警告: 読み込みor処理失敗: {in_path}")
+                continue
 
-                # デコード
-                original_decode = self.decoder.decode_from_path(original_path)
-                enhanced_decode = self.decoder.decode_from_path(enhanced_path)
-
-                match = (original_decode is not None) and (
-                    original_decode == enhanced_decode
+            h, w = binary.shape
+            vector = self._binary_to_module_vector(binary)
+            out_json = os.path.join(self.vector_dir, f"{os.path.splitext(filename)[0]}.json")
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "file": filename,
+                        "module": self.module,
+                        "width": int(w),
+                        "height": int(h),
+                        "vector": vector,  # 0/1
+                    },
+                    f, ensure_ascii=False
                 )
+            print(f"  保存: {out_json}")
 
-                result = {
-                    "file": filename,
-                    "toba": original_decode,
-                    "raimu": enhanced_decode,
-                    "match": match,
-                }
-                evaluation_results.append(result)
-                print(f"デコード結果: {result}")
+            # トップ行平均の集約（NaN除外）
+            avgs = self.enhancer.get_top_row_avgs()
+            self._top_row_avgs_all.extend([float(a) for a in avgs if a == a])
 
-        # 結果をJSON保存
-        evaluate_file_path = "evaluate.json"
-        with open(evaluate_file_path, "w", encoding="utf-8") as f:
-            json.dump(evaluation_results, f, indent=4, ensure_ascii=False)
-        print(
-            f"\nすべての処理が完了しました。評価結果は '{evaluate_file_path}' に保存されました。"
+        # 1枚だけ統合プロットを保存（qr_statistics）
+        self._save_combined_top_row_statistics(
+            out_path=os.path.join(self.statistics_dir, "sikiiti.png"),
+            thresh=self.enhancer.top_row_thresh,
         )
+
+    # ========= Step2 =========
+    def step2_build_images_and_evaluate(self) -> None:
+        """
+        qr_vector/*.json から画像を再生成し qr_raimu/*.png へ保存。
+        その後、元画像 vs 再生成画像でデコード比較し evaluate.json に保存。
+        """
+        if not os.path.exists(self.vector_dir):
+            print(f"エラー: ベクトルディレクトリ '{self.vector_dir}' が見つかりません。まず Step1 を実行してください。")
+            return
+        os.makedirs(self.raimu_dir, exist_ok=True)
+
+        def _key(x: str) -> int:
+            stem = os.path.splitext(x)[0]
+            try:
+                return int(stem)
+            except ValueError:
+                return 10**9
+
+        vector_files = sorted(
+            [f for f in os.listdir(self.vector_dir) if f.lower().endswith(".json")],
+            key=_key
+        )
+
+        # JSON→画像
+        for vec_name in vector_files:
+            vec_path = os.path.join(self.vector_dir, vec_name)
+            with open(vec_path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+
+            filename = obj.get("file") or f"{os.path.splitext(vec_name)[0]}.png"
+            w = int(obj["width"])
+            h = int(obj["height"])
+            module = int(obj["module"])
+            vector = obj["vector"]
+
+            img = self._vector_to_image(vector, width=w, height=h, module=module)
+            out_img_path = os.path.join(self.raimu_dir, os.path.splitext(filename)[0] + ".png")
+            cv2.imwrite(out_img_path, img)
+            print(f"[Step2] 生成: {out_img_path}")
+
+        # 評価
+        print("\n[Step2] デコード評価（original vs reconstructed）")
+        evaluation_results: List[Dict[str, Any]] = []
+
+        out_images = sorted(
+            [f for f in os.listdir(self.raimu_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))],
+            key=_key,
+        )
+        for filename in out_images:
+            orig_path = os.path.join(self.tobako_dir, filename)
+            if not os.path.exists(orig_path):
+                alt = self._find_alt_original(filename)
+                orig_path = alt or orig_path
+
+            recon_path = os.path.join(self.raimu_dir, filename)
+
+            orig = self.decoder.decode_from_path(orig_path) if os.path.exists(orig_path) else None
+            recon = self.decoder.decode_from_path(recon_path)
+
+            match = (orig is not None) and (orig == recon)
+            result = {
+                "file": filename,
+                "original": orig,
+                "reconstructed": recon,
+                "match": match,
+            }
+            evaluation_results.append(result)
+            print(f"  {filename}: match={match} | original={orig} | reconstructed={recon}")
+
+        with open("evaluate.json", "w", encoding="utf-8") as f:
+            json.dump(evaluation_results, f, indent=4, ensure_ascii=False)
+        print("完了: 評価結果を 'evaluate.json' に保存しました。")
+
+    # ========= 元の一括 run（必要なら） =========
+    def run(self) -> None:
+        """従来互換: Step1→Step2 を続けて実行"""
+        self.step1_make_vectors()
+        self.step2_build_images_and_evaluate()
+
+    # ========= Helpers =========
+
+    def _binary_to_module_vector(self, binary: np.ndarray) -> List[List[int]]:
+        """
+        2値画像（0/255）を module x module の 0/1 ベクトルに落とす。
+        1=黒(0側)、0=白(255側)
+        """
+        h, w = binary.shape
+        module = self.module
+        cell_w = w // module
+        cell_h = h // module
+
+        vec: List[List[int]] = []
+        for gy in range(module):
+            row: List[int] = []
+            y0 = gy * cell_h
+            y1 = (gy + 1) * cell_h if gy < module - 1 else h
+            for gx in range(module):
+                x0 = gx * cell_w
+                x1 = (gx + 1) * cell_w if gx < module - 1 else w
+                cell = binary[y0:y1, x0:x1]
+                v = 1 if np.mean(cell) < 128 else 0  # 保険として平均で判定
+                row.append(int(v))
+            vec.append(row)
+        return vec
+
+    def _vector_to_image(self, vector: List[List[int]], width: int, height: int, module: int) -> np.ndarray:
+        """
+        module x module の 0/1 ベクトルから元サイズの2値画像(0/255)を再生成。
+        1=黒 → 0, 0=白 → 255
+        """
+        img = np.ones((height, width), dtype=np.uint8) * 255
+        cell_w = width // module
+        cell_h = height // module
+
+        for gy in range(module):
+            y0 = gy * cell_h
+            y1 = (gy + 1) * cell_h if gy < module - 1 else height
+            for gx in range(module):
+                x0 = gx * cell_w
+                x1 = (gx + 1) * cell_w if gx < module - 1 else width
+                val = 0 if vector[gy][gx] == 1 else 255
+                img[y0:y1, x0:x1] = val
+        return img
+
+    def _find_alt_original(self, filename: str) -> str | None:
+        """
+        同名拡張子違い（.jpg / .jpeg / .png）で元画像を探索。
+        """
+        stem = os.path.splitext(filename)[0]
+        for ext in (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"):
+            p = os.path.join(self.tobako_dir, stem + ext)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _save_combined_top_row_statistics(self, out_path: str, thresh: float):
+        data = np.array(self._top_row_avgs_all, dtype=float)
+        if data.size == 0:
+            print("[TopRow-Combined] データがないため統計グラフを作成しません。")
+            return
+
+        fig = plt.figure(figsize=(10, 6), layout="constrained")
+        ax1 = fig.add_subplot(2, 1, 1)
+        ax2 = fig.add_subplot(2, 1, 2)
+
+        ax1.plot(np.arange(data.size), data, linewidth=1, color="#377eb8", label="mean intensity")
+        ax1.axhline(thresh, color="r", linestyle="--", label=f"threshold={thresh}")
+        ax1.set_title("Top-row cell means (all images, concatenated)")
+        ax1.set_xlabel("appearance index")
+        ax1.set_ylabel("mean intensity (0-255)")
+        ax1.set_ylim(0, 255)
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(loc="best")
+
+        ax2.hist(data, bins=40, color="#4C72B0", alpha=0.9, edgecolor="black")
+        ax2.axvline(thresh, color="r", linestyle="--", label=f"threshold={thresh}")
+        ax2.set_title("Distribution of top-row cell means (all images)")
+        ax2.set_xlabel("mean intensity")
+        ax2.set_ylabel("count")
+        ax2.set_xlim(0, 255)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="best")
+
+        fig.suptitle("Top-row statistics (aggregated)", fontsize=14)
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"[TopRow-Combined] 統計グラフを '{out_path}' に保存しました。")
 
 ====./pipeline/qr_enhancer.py ====
 import cv2
@@ -129,35 +670,64 @@ import numpy as np
 class QREnhancer:
     """
     QRコード画像を加工するクラス。
-    現状は「モジュール単位の2値化」と「finder pattern の塗りつぶし」に特化。
+    - 一番上の行の特別処理（グレースケール段階）
+    - 通常のgrid二値化（上一行を除外）
+    - finder pattern の塗りつぶし
+    - 最後にトップ行の判定結果を強制反映
     """
 
     def __init__(
-        self, module: int = 33, white_thresh: int = 220, black_thresh: int = 50
+        self,
+        module: int = 33,
+        white_thresh: int = 220,
+        black_thresh: int = 50,
+        avg_thresh: int = 128,       # 通常の平均値しきい値
+        top_row_thresh: int = 160,   # 上一行専用の黒寄りしきい値
+        finder_size: int = 7,        # finder pattern の外枠サイズ（セル単位）
     ):
         self.module = module
         self.white_thresh = white_thresh
         self.black_thresh = black_thresh
+        self.avg_thresh = avg_thresh
+        self.top_row_thresh = top_row_thresh
+        self.finder_size = finder_size
+        self._top_row_values: list[int] | None = None   # 0/255
+        self._top_row_avgs: list[float] | None = None   # 平均値(グレースケール)
 
     def binarize(self, path: str) -> np.ndarray | None:
+        """
+        QRコード画像を読み込み、鮮明化した2値画像を返す。
+        """
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             return None
 
+        # Step 1: 上一行を先に補正（グレースケール）
+        img = self._fix_top_row(img)
+
         h, w = img.shape
-        grid_size_x = w // self.module
-        grid_size_y = h // self.module
+        grid_size_x = max(1, w // self.module)
+        grid_size_y = max(1, h // self.module)
+        fs = self.finder_size
 
         binary = np.ones_like(img, dtype=np.uint8) * 255  # 白で初期化
 
-        for gy in range(self.module):
-            for gx in range(self.module):
-                x_start = gx * grid_size_x
-                y_start = gy * grid_size_y
-                x_end = (gx + 1) * grid_size_x if gx < self.module - 1 else w
-                y_end = (gy + 1) * grid_size_y if gy < self.module - 1 else h
+        # Step 2: 上一行は fix_top_row の結果をそのままコピー
+        y0, y1 = 0, grid_size_y
+        binary[y0:y1, :] = img[y0:y1, :]
 
-                cell = img[y_start:y_end, x_start:x_end]
+        # Step 3: 通常のgrid二値化（上一行はスキップ）
+        for gy in range(1, self.module):
+            for gx in range(self.module):
+                x0 = gx * grid_size_x
+                y0 = gy * grid_size_y
+                x1 = (gx + 1) * grid_size_x if gx < self.module - 1 else w
+                y1 = (gy + 1) * grid_size_y if gy < self.module - 1 else h
+
+                if x0 >= w or y0 >= h:
+                    continue
+
+                cell = img[y0:y1, x0:x1]
 
                 has_white = np.any(cell >= self.white_thresh)
                 has_black = np.any(cell <= self.black_thresh)
@@ -166,81 +736,163 @@ class QREnhancer:
                     value = 255
                 elif has_black and not has_white:
                     value = 0
-                elif has_white and has_black:
-                    avg = np.mean(cell)
-                    value = 255 if avg >= 128 else 0
                 else:
                     avg = np.mean(cell)
-                    value = 255 if avg >= 128 else 0
+                    value = 255 if avg >= self.avg_thresh else 0
 
-                binary[y_start:y_end, x_start:x_end] = value
+                binary[y0:y1, x0:x1] = value
 
-        # finder pattern を強制的に黒に塗りつぶす
+        # Step 4: finder を強制塗り
         binary = self._fill_finder_patterns(binary)
+
+        # Step 5: トップ行の判定結果を最終的に強制反映（finder列は除外）
+        if self._top_row_values is not None:
+            y0, y1 = 0, grid_size_y
+            for gx, val in enumerate(self._top_row_values):
+                if gx < fs or gx >= self.module - fs:
+                    continue
+                x0 = gx * grid_size_x
+                x1 = (gx + 1) * grid_size_x if gx < self.module - 1 else w
+                binary[y0:y1, x0:x1] = val
 
         return binary
 
     def _fill_finder_patterns(self, binary: np.ndarray) -> np.ndarray:
         """
         左上・右上・左下の finder pattern を正しい構造で塗りつぶす。
-        外黒7×7 → 中白5×5 → 中央黒3×3。
+        外黒 finder_size×finder_size → 中白 (finder_size-1)枠内 → 中央 (finder_size-2)
         """
         h, w = binary.shape
-        grid_size_x = w // self.module
-        grid_size_y = h // self.module
+        grid_size_x = max(1, w // self.module)
+        grid_size_y = max(1, h // self.module)
+        fs = self.finder_size
 
         def draw_finder(x0, y0):
-            # 7×7 黒枠
-            binary[y0 : y0 + 7 * grid_size_y, x0 : x0 + 7 * grid_size_x] = 0
-            # 内側 5×5 白
+            # 外側 黒
+            binary[y0 : y0 + fs * grid_size_y, x0 : x0 + fs * grid_size_x] = 0
+            # 内側 白
             binary[
-                y0 + grid_size_y : y0 + 6 * grid_size_y,
-                x0 + grid_size_x : x0 + 6 * grid_size_x,
+                y0 + grid_size_y : y0 + (fs - 1) * grid_size_y,
+                x0 + grid_size_x : x0 + (fs - 1) * grid_size_x,
             ] = 255
-            # 中央 3×3 黒
+            # 中央 黒
             binary[
-                y0 + 2 * grid_size_y : y0 + 5 * grid_size_y,
-                x0 + 2 * grid_size_x : x0 + 5 * grid_size_x,
+                y0 + 2 * grid_size_y : y0 + (fs - 2) * grid_size_y,
+                x0 + 2 * grid_size_x : x0 + (fs - 2) * grid_size_x,
             ] = 0
 
-        # 左上
         draw_finder(0, 0)
-        # 右上
-        draw_finder(w - 7 * grid_size_x, 0)
-        # 左下
-        draw_finder(0, h - 7 * grid_size_y)
+        draw_finder(w - fs * grid_size_x, 0)
+        draw_finder(0, h - fs * grid_size_y)
 
         return binary
 
+    def _fix_top_row(self, img: np.ndarray) -> np.ndarray:
+        """
+        グレースケール段階で QRコードの一番上の行を補正。
+        併せてセルごとの平均値/最終値を保存。
+        """
+        h, w = img.shape
+        grid_size_x = max(1, w // self.module)
+        grid_size_y = max(1, h // self.module)
+
+        y0, y1 = 0, grid_size_y
+        top_vals: list[int] = []
+        top_avgs: list[float] = []
+
+        for gx in range(self.module):
+            x0 = gx * grid_size_x
+            x1 = (gx + 1) * grid_size_x if gx < self.module - 1 else w
+
+            cell = img[y0:y1, x0:x1]
+            if cell.size == 0:
+                top_vals.append(255)
+                top_avgs.append(np.nan)
+                continue
+
+            avg = float(np.mean(cell))
+            value = 0 if avg < self.top_row_thresh else 255
+            label = "BLACK" if value == 0 else "WHITE"
+
+            print(f"[TopRow] gx={gx:02d}, avg={avg:.2f}, thresh={self.top_row_thresh}, -> {label}")
+
+            img[y0:y1, x0:x1] = value
+            top_vals.append(value)
+            top_avgs.append(avg)
+
+        self._top_row_values = top_vals
+        self._top_row_avgs = top_avgs
+        return img
+
+    # トップ行の平均値配列を取得（コピーを返す）
+    def get_top_row_avgs(self) -> list[float]:
+        return list(self._top_row_avgs or [])
+
 ====./main.py ====
 import sys
+import os
+
 from pipeline.pipeline import QRPipeline
 import evaluate.evaluate_pdf as evaluate_pdf
 import evaluate.overlay_pdf as overlay_pdf
 import evaluate.analysis_pdf as analysis_pdf
 
+def run_editor():
+    try:
+        from tools.qr_vector_editor_flask.app import start
+    except Exception as e:
+        print("エラー: エディタの起動モジュールをインポートできませんでした。")
+        print("原因:", e)
+        return
 
-def run_pipeline():
-    """
-    QRコードの鮮明化とデコードのパイプラインを実行する関数。
-    """
+    # ★ ここを 0.0.0.0 固定に（Docker/WSL/別PCから見られる）
+    host = "0.0.0.0"
+    port = int(os.environ.get("FLASK_RUN_PORT", "5000"))
+
+    print("\n--- QRベクター編集ツールを起動します ---")
+    print(f"URL(ローカル): http://127.0.0.1:{port}/")
+    print(f"URL(ネットワーク): http://<このマシンのIP>:{port}/")
+    print("停止するには Ctrl+C")
+
+    start(host=host, port=port, debug=False)
+
+
+
+def build_pipeline() -> QRPipeline:
     tobako_dir = "qr_tobakosan"
     raimu_dir = "qr_raimu"
+    vector_dir = "qr_vector"
+    statistics_dir = "qr_statistics" 
 
     params = {
         "module": 33,
         "white_thresh": 220,
         "black_thresh": 50,
+        "avg_thresh": 128,
+        "top_row_thresh": 160,
+        "finder_size": 7,
     }
 
-    pipeline_runner = QRPipeline(tobako_dir, raimu_dir, enhancer_params=params)
-    pipeline_runner.run()
+    return QRPipeline(
+        tobako_dir=tobako_dir,
+        raimu_dir=raimu_dir,
+        vector_dir=vector_dir,
+        statistics_dir=statistics_dir,  
+        enhancer_params=params,
+    )
 
 
-def run_evaluation():
-    """
-    評価レポート生成プロセスを実行する関数。
-    """
+def run_step1_vectors():
+    pipeline = build_pipeline()
+    pipeline.step1_make_vectors()
+
+
+def run_step2_reconstruct_and_evaluate():
+    pipeline = build_pipeline()
+    pipeline.step2_build_images_and_evaluate()
+
+
+def run_step3_reports():
     try:
         print("\n--- 評価レポートの生成を開始します ---")
         evaluate_pdf.main()
@@ -249,22 +901,28 @@ def run_evaluation():
         print("--- 評価レポートの生成が完了しました ---")
     except FileNotFoundError:
         print("\nエラー: 評価に必要なファイルが見つかりません。")
-        print("パイプラインを実行して、まずデータを生成してください。")
+        print("Step1 と Step2 を実行してデータを生成してください。")
 
 
 if __name__ == "__main__":
     print("\n--- QRコード評価システム ---")
     print("実行したい処理を選択してください:")
-    print("1: QRコード鮮明化パイプラインの実行（データ生成）")
-    print("2: 評価レポートの生成（PDF出力）")
+    print("1: Step1 ベクトル作成（qr_vector/*.json を生成）")
+    print("2: Step2 画像再生成＋評価（raimu画像と evaluate.json を生成）")
+    print("3: Step3 評価レポートの生成（PDF出力）")
+    print("4: QRベクター編集ツールを起動（Flask）")  # ★ 追加
     print("それ以外: 終了")
 
-    user_input = input("選択肢の番号を入力してください: ")
+    user_input = input("選択肢の番号を入力してください: ").strip()
 
     if user_input == "1":
-        run_pipeline()
+        run_step1_vectors()
     elif user_input == "2":
-        run_evaluation()
+        run_step2_reconstruct_and_evaluate()
+    elif user_input == "3":
+        run_step3_reports()
+    elif user_input == "4":         # ★ 追加
+        run_editor()
     else:
         print("システムを終了します。")
         sys.exit()

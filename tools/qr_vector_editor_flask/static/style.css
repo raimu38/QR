@@ -1,0 +1,108 @@
+/* static/style.css — 左をスクロール可能、右を固定表示にするスタイル */
+
+html, body {
+  height: 100%;
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #111;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 全体レイアウト：高さを 100vh に固定してページ全体のスクロールを防ぐ */
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 2fr; /* 左 1/3, 右 2/3 相当 */
+  gap: 0;
+  height: 100vh;      /* 画面高さいっぱい */
+  overflow: hidden;   /* 外側のスクロールを消す（左は内部でスクロール） */
+}
+
+/* 左の一覧：内部でスクロール */
+.list-pane {
+  border-right: 1px solid #ddd;
+  padding: 16px;
+  background: #fafafa;
+  overflow-y: auto;    /* ← ここが肝：左だけスクロール */
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ファイルリスト */
+.file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.item {
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 8px;
+  cursor: pointer;
+  background: #fff;
+}
+.item:hover { background: #f7f7f7; }
+
+/* 行に2枚のサムネを横並び表示 */
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-items: center; }
+.row img { width: 100%; height: auto; image-rendering: pixelated; border: 1px solid #ccc; background: #fff; }
+
+/* 右側（編集領域）：画面に固定（高さ100vh） */
+.editor-pane {
+  padding: 16px;
+  overflow: hidden;   /* 右は固定なので外側のスクロールはしない（内部が多ければ下部で個別実装可） */
+  box-sizing: border-box;
+  background: #fff;
+  height: 100vh;      /* 右も高さ100vh */
+  position: relative; /* 基本固定表示 */
+}
+
+/* プレースホルダ */
+.placeholder { color: #666; padding: 24px; font-size: 14px; }
+
+/* 隠すためのクラス */
+.hidden { display: none; }
+
+/* topbar */
+.topbar { display:flex; justify-content: space-between; align-items:center; margin-bottom:12px; gap:12px; }
+#status { margin-left: 12px; color: #2f855a; }
+
+/* 比較パネル：両方同じサイズで並べる */
+.compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  height: calc(100vh - 120px); /* topbar 等を考慮して高さを確保（微調整可） */
+}
+
+/* 各パネル内のスクロール（必要なら個別でスクロール可能にする） */
+.panel {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 12px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-start;
+  overflow: auto; /* 内部の長い説明文などがはみ出す場合に備える */
+}
+
+/* 画像/キャンバスは同じ見た目サイズに */
+#orig-large, #qr-canvas {
+  width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+  border: 1px solid #ccc;
+  background: #fff;
+  display: block;
+}
+
+/* レスポンシブ微調整（画面が狭い場合は縦積み） */
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; height: auto; }
+  .list-pane { height: auto; max-height: 40vh; }
+  .editor-pane { height: auto; }
+  .compare { grid-template-columns: 1fr; height: auto; }
+}

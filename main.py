@@ -6,9 +6,26 @@ import evaluate.evaluate_pdf as evaluate_pdf
 import evaluate.overlay_pdf as overlay_pdf
 import evaluate.analysis_pdf as analysis_pdf
 
-# main.py（抜粋）
-from pipeline.pipeline import QRPipeline
-# ...
+def run_editor():
+    try:
+        from tools.qr_vector_editor_flask.app import start
+    except Exception as e:
+        print("エラー: エディタの起動モジュールをインポートできませんでした。")
+        print("原因:", e)
+        return
+
+    # ★ ここを 0.0.0.0 固定に（Docker/WSL/別PCから見られる）
+    host = "0.0.0.0"
+    port = int(os.environ.get("FLASK_RUN_PORT", "5000"))
+
+    print("\n--- QRベクター編集ツールを起動します ---")
+    print(f"URL(ローカル): http://127.0.0.1:{port}/")
+    print(f"URL(ネットワーク): http://<このマシンのIP>:{port}/")
+    print("停止するには Ctrl+C")
+
+    start(host=host, port=port, debug=False)
+
+
 
 def build_pipeline() -> QRPipeline:
     tobako_dir = "qr_tobakosan"
@@ -35,25 +52,16 @@ def build_pipeline() -> QRPipeline:
 
 
 def run_step1_vectors():
-    """
-    Step1: ベクトル作成（qr_vector/*.json）＋ sikiiti.png の作成
-    """
     pipeline = build_pipeline()
     pipeline.step1_make_vectors()
 
 
 def run_step2_reconstruct_and_evaluate():
-    """
-    Step2: JSONから画像再生成（qr_raimu/*.png）＋ デコード評価（evaluate.json）
-    """
     pipeline = build_pipeline()
     pipeline.step2_build_images_and_evaluate()
 
 
 def run_step3_reports():
-    """
-    Step3: 評価レポート生成（PDF出力）: 既存の evaluate/* モジュールを実行
-    """
     try:
         print("\n--- 評価レポートの生成を開始します ---")
         evaluate_pdf.main()
@@ -71,6 +79,7 @@ if __name__ == "__main__":
     print("1: Step1 ベクトル作成（qr_vector/*.json を生成）")
     print("2: Step2 画像再生成＋評価（raimu画像と evaluate.json を生成）")
     print("3: Step3 評価レポートの生成（PDF出力）")
+    print("4: QRベクター編集ツールを起動（Flask）")  # ★ 追加
     print("それ以外: 終了")
 
     user_input = input("選択肢の番号を入力してください: ").strip()
@@ -81,6 +90,8 @@ if __name__ == "__main__":
         run_step2_reconstruct_and_evaluate()
     elif user_input == "3":
         run_step3_reports()
+    elif user_input == "4":         # ★ 追加
+        run_editor()
     else:
         print("システムを終了します。")
         sys.exit()
