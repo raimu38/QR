@@ -43,11 +43,15 @@ cd QR
 2. **ライブラリのインストール**: `requirements.txt`に以下の内容を記述し、`pip`でインストールする。
 
    ```
-   numpy==2.2.2
+  numpy==2.2.2
    opencv-python-headless==4.12.0.88
    pyzbar==0.1.9
    fpdf2==2.8.4
    matplotlib==3.10.6
+   pillow==11.3.0
+   pandas==2.3.2
+   Flask>=3.0.0
+ 
    ```
 
    インストールコマンド: `pip install -r requirements.txt`
